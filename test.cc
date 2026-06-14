@@ -1,79 +1,120 @@
-#include <liburing.h>
-#include <fcntl.h>
+#include "server.hpp"
 #include <iostream>
-#include <unistd.h>
-#include <string.h>
-#include <thread>
-#include <sys/socket.h>
-#include <memory>
-const char* book_file = "book.txt";
-const char book_name[] = "认知觉醒\n非暴力沟通\n被讨厌的勇气";
-using std::cout;
-using std::endl;
-using std::cerr;
+#include <signal.h>
 
-int main()
-{
+using namespace pa;
 
-	
-    int sv[2];  // sv[0] 读端，sv[1] 写端
-    
-    // 创建一对连接的 socket（类似管道，但更适合 io_uring）
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
-        perror("socketpair failed");
-        return 1;
+// ──── 简单 JSON 序列化（避免引入第三方库）──────────────────────────────────────
+inline std::string jsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n";  break;
+        case '\r': out += "\\r";  break;
+        case '\t': out += "\\t";  break;
+        default:   out += c;
+        }
     }
-    
-    char buff[200] = {0};
+    return out;
+}
 
-    io_uring ring;
-    if (io_uring_queue_init(64, &ring, 0) != 0) {
-        perror("init queue error");
-        return 1;
-    }
-	// write(sv[1], "abcde", 3);
-    // 写线程：10秒后写入数据
-    std::thread t([&]() {
-        sleep(5);
-        cout << "开始写入数据..." << endl;
-        int bytes_written = write(sv[1], book_name, sizeof(book_name));
-        cout << "写入 " << bytes_written << " 字节" << endl;
-        close(sv[1]);  // 写完关闭写端
+int main() {
+    // 不注册 SIGINT 处理器——保留默认行为，Ctrl+C 直接终止进程
+    signal(SIGPIPE, SIG_IGN);  // 防止向已关闭连接写入时触发 SIGPIPE
+
+    const int  PORT       = 8080;
+    const int  THREADS    = 3;        // 根据 CPU 核数调整
+    const int  IDLE_SEC   = 30;       // 空闲连接超时
+
+    // ── 创建 HTTP 服务器 ──────────────────────────────────────────────────────
+    HttpServer server(PORT, IDLE_SEC);
+    server.SetThreadCount(THREADS);
+    server.SetAssetDir("./wwwroot/");
+
+    // ── 注册路由 ──────────────────────────────────────────────────────────────
+
+    // 1. GET /hello — 纯文本压测（wrk -t4 -c100 -d30s http://host:8080/hello）
+    server.AddGetMethod("/hello", [](const HttpRequest& req, HttpResponse* resp) {
+        (void)req;
+        resp->SetContent("Hello, world!\n", "text/plain");
     });
 
-    // 主线程：提交异步读请求
+    // 2. GET /json — JSON 响应压测
+    server.AddGetMethod("/json", [](const HttpRequest& req, HttpResponse* resp) {
+        (void)req;
+        std::string body = "{\"status\":\"ok\",\"message\":\"Hello from pa_server\"}";
+        resp->SetContent(body, "application/json");
+    });
 
-	// 永远不会阻塞，只会返回 NULL 表示 SQ 已满。
-    io_uring_sqe* sqe_r = io_uring_get_sqe(&ring);
-    io_uring_sqe* sqe_w = io_uring_get_sqe(&ring);
-    
-    // 注意：socket 的读操作如果没有数据，会阻塞等待（而不是立即返回 EOF）
-    io_uring_prep_read(sqe_r, sv[0], buff, sizeof(buff), 0);
-	io_uring_prep_write(sqe_w, sv[1], "hello", 5, 0);
-    
-    io_uring_submit(&ring);
-    cout << "读请求已提交，等待数据..." << endl;
-    
-    // 阻塞等待读完成（会真正等待直到写入线程写入数据）
-    io_uring_cqe* cqe;
-	cout << "waiting in io_uring_wait_cqe" << endl;
-    io_uring_wait_cqe(&ring, &cqe);
-    
-    if (cqe->res < 0) {
-        cerr << "read failed: " << strerror(-cqe->res) << endl;
-        return 1;
-    }
-    
-    int bytes_read = cqe->res;
-    buff[bytes_read] = '\0';
-    io_uring_cqe_seen(&ring, cqe);
-    
-    cout << "读取 " << bytes_read << " 字节" << endl;
-    cout << "内容：\n" << buff << endl;
-    
-    close(sv[0]);
-    t.join();
-    
-    io_uring_queue_exit(&ring);
+    // 3. POST /echo — 回显请求正文（测试读写混合）
+    server.AddPostMethod("/echo", [](const HttpRequest& req, HttpResponse* resp) {
+        resp->SetContent(req._body, req.GetHeader("Content-Type"));
+    });
+
+    // 4. GET /params?key=val — 查询字符串解析测试
+    server.AddGetMethod("/params", [](const HttpRequest& req, HttpResponse* resp) {
+        std::string body = "{";
+        bool first = true;
+        for (auto& [k, v] : req._parameters) {
+            if (!first) body += ",";
+            first = false;
+            body += "\"" + jsonEscape(k) + "\":\"" + jsonEscape(v) + "\"";
+        }
+        body += "}";
+        resp->SetContent(body, "application/json");
+    });
+
+    // 5. POST /upload — 测量请求体接收速度
+    server.AddPostMethod("/upload", [](const HttpRequest& req, HttpResponse* resp) {
+        resp->SetContent(
+            "{\"received\":" + std::to_string(req._body.size()) + "}",
+            "application/json");
+    });
+
+    // 6. PUT /put — PUT 方法测试
+    server.AddPutMethod("/put", [](const HttpRequest& req, HttpResponse* resp) {
+        resp->SetContent(
+            "{\"method\":\"PUT\",\"body_size\":" + std::to_string(req._body.size()) + "}",
+            "application/json");
+    });
+
+    // 7. DELETE /delete — DELETE 方法测试
+    server.AddDeleteMethod("/delete", [](const HttpRequest& req, HttpResponse* resp) {
+        (void)req;
+        resp->SetContent("{\"status\":\"deleted\"}", "application/json");
+    });
+
+    // ── 打印启动信息 ──────────────────────────────────────────────────────────
+    std::cout << "\n"
+              << "╔══════════════════════════════════════════════════════╗\n"
+              << "║   pa_server — io_uring Master-Slave Proactor        ║\n"
+              << "║   HTTP/1.1 Server                                   ║\n"
+              << "╠══════════════════════════════════════════════════════╣\n"
+              << "║   Port:     " << PORT << "                                       ║\n"
+              << "║   Threads:  " << THREADS << "                                         ║\n"
+              << "║   Idle:     " << IDLE_SEC << "s                                       ║\n"
+              << "╠══════════════════════════════════════════════════════╣\n"
+              << "║   Routes:                                           ║\n"
+              << "║     GET  /hello          plain text                 ║\n"
+              << "║     GET  /json           JSON response              ║\n"
+              << "║     GET  /params?k=v     query string test          ║\n"
+              << "║     POST /echo           echo body                  ║\n"
+              << "║     POST /upload         count body size            ║\n"
+              << "║     PUT  /put            PUT test                   ║\n"
+              << "║     DELETE /delete       DELETE test                ║\n"
+              << "║     GET  /*              static files (./wwwroot/)  ║\n"
+              << "╠══════════════════════════════════════════════════════╣\n"
+              << "║   Benchmark:                                        ║\n"
+              << "║     wrk -t4 -c100 -d30s http://127.0.0.1:8080/hello ║\n"
+              << "║     ab -n 100000 -c 100 http://127.0.0.1:8080/hello ║\n"
+              << "╚══════════════════════════════════════════════════════╝\n"
+              << std::endl;
+
+    // ── 启动 ──────────────────────────────────────────────────────────────────
+    server.Start();
+
     return 0;
 }

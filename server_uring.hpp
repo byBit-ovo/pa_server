@@ -1,6 +1,3 @@
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
 #ifndef PA_SERVER_HPP
 #define PA_SERVER_HPP
 
@@ -10,7 +7,6 @@
 #include <sys/types.h>
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
-#include <sys/epoll.h>
 #include <sys/fcntl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -449,12 +445,12 @@ private:
 // ══════════════════════════════════════════════════════════════════════════════
 //
 //  取代原版的 EventLoop + Epoller + Channel 三层结构。
-//  //  Master EpollEventLoop: epoll 监听 accept + timerfd（控制面）
+//  Master Proactor: 提交 accept + timerfd read，CQE 由 TcpServer::OnMasterCQE 处理
 //    - 一个独立的 io_uring 实例（取代 epoll fd）
 //    - 一个 eventfd（跨线程唤醒，取代原版 Eventfd + Channel 组合）
 //    - 一个后台线程（Run方法阻塞运行）
 //
-//  Master EpollEventLoop: epoll 监听 accept + timerfd + eventfd（控制面）
+//  Slave  Proactor: 提交 recv/send/close，CQE 路由到 Connection 回调
 //  Slave  Proactor: 提交 recv/send/close，CQE 路由到 Connection 回调
 //
 class Proactor {
@@ -547,140 +543,6 @@ private:
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  EpollEventLoop — Master 线程 epoll 事件循环
-// ══════════════════════════════════════════════════════════════════════════════
-//
-//  取代 Master Proactor（io_uring），用于监听 accept + timerfd + eventfd。
-//  Master 只做控制面工作，不接触数据 I/O，epoll 的 while(accept4()) 模式
-//  在连接洪水场景下比 io_uring 的异步 accept 更高效。
-//
-class EpollEventLoop {
-public:
-    using Task  = std::function<void()>;
-    using EventHandler = std::function<void()>;
-
-    EpollEventLoop()
-        : _running(false)
-    {
-        _epfd = epoll_create1(EPOLL_CLOEXEC);
-        if (_epfd < 0) {
-            LOG(FATAL) << "epoll_create1 failed: " << strerror(errno);
-            exit(1);
-        }
-        _eventFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-        if (_eventFd < 0) {
-            LOG(FATAL) << "eventfd creation failed";
-            exit(1);
-        }
-        // 注册 eventfd（边缘触发）
-        struct epoll_event ev;
-        ev.events   = EPOLLIN | EPOLLET;
-        ev.data.fd  = _eventFd;
-        epoll_ctl(_epfd, EPOLL_CTL_ADD, _eventFd, &ev);
-    }
-
-    ~EpollEventLoop() {
-        Stop();
-        if (_epfd >= 0)    { close(_epfd);    _epfd = -1; }
-        if (_eventFd >= 0) { close(_eventFd); _eventFd = -1; }
-    }
-
-    EpollEventLoop(const EpollEventLoop&) = delete;
-    EpollEventLoop& operator=(const EpollEventLoop&) = delete;
-
-    // ── 生命周期 ──────────────────────────────────────────────────────────
-    void Start() {
-        _running.store(true, std::memory_order_relaxed);
-        _tid = std::this_thread::get_id();
-        Run();
-    }
-
-    void Stop() {
-        _running.store(false, std::memory_order_relaxed);
-        uint64_t val = 1;
-        ssize_t n = write(_eventFd, &val, sizeof(val));
-        (void)n;
-    }
-
-    // ── 跨线程任务 ────────────────────────────────────────────────────────
-    void PostTask(Task task) {
-        {
-            std::lock_guard<std::mutex> lk(_taskMtx);
-            _pendingTasks.push_back(std::move(task));
-        }
-        uint64_t val = 1;
-        ssize_t n = write(_eventFd, &val, sizeof(val));
-        (void)n;
-    }
-
-    void ProcessTasks() {
-        std::vector<Task> tasks;
-        {
-            std::lock_guard<std::mutex> lk(_taskMtx);
-            tasks.swap(_pendingTasks);
-        }
-        for (auto& t : tasks) t();
-    }
-
-    // ── 注册 fd（边缘触发，EPOLLIN）────────────────────────────────────────
-    void AddFd(int fd, EventHandler handler) {
-        _handlers[fd] = std::move(handler);
-        struct epoll_event ev;
-        ev.events   = EPOLLIN | EPOLLET;
-        ev.data.fd  = fd;
-        epoll_ctl(_epfd, EPOLL_CTL_ADD, fd, &ev);
-    }
-
-    // ── 线程标识 ──────────────────────────────────────────────────────────
-    std::thread::id ThreadId()  const { return _tid; }
-    bool            IsInThread() const { return std::this_thread::get_id() == _tid; }
-
-private:
-    void Run() {
-        LOG(DEBUG) << "EpollEventLoop::Run start, tid=" << std::this_thread::get_id();
-
-        struct epoll_event events[MAX_EVENTS];
-
-        while (_running.load(std::memory_order_relaxed)) {
-            int n = epoll_wait(_epfd, events, MAX_EVENTS, -1);
-            if (n < 0) {
-                if (errno == EINTR) continue;
-                LOG(ERROR) << "epoll_wait error: " << strerror(errno);
-                break;
-            }
-
-            for (int i = 0; i < n; ++i) {
-                int fd = events[i].data.fd;
-
-                if (fd == _eventFd) {
-                    // 跨线程唤醒：消耗计数器 + 执行积压任务
-                    uint64_t val;
-                    ssize_t r = read(_eventFd, &val, sizeof(val));
-                    (void)r;
-                    ProcessTasks();
-                } else {
-                    // 其他 fd（listen / timerfd）→ 执行已注册的回调
-                    auto it = _handlers.find(fd);
-                    if (it != _handlers.end()) {
-                        it->second();
-                    }
-                }
-            }
-        }
-
-        LOG(DEBUG) << "EpollEventLoop::Run exit, tid=" << std::this_thread::get_id();
-    }
-
-    int                    _epfd;
-    int                    _eventFd;
-    std::atomic<bool>      _running;
-    std::thread::id        _tid;
-    std::mutex             _taskMtx;
-    std::vector<Task>      _pendingTasks;
-    std::unordered_map<int, EventHandler> _handlers;
-
-    static const int MAX_EVENTS = 32;
-};
 
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -717,8 +579,11 @@ public:
     void Start();
 
 private:
-    void HandleAccept();
-    void HandleTimer();
+    void HandleAccept(int newFd);
+    void HandleTimer(int times);
+    void OnMasterCQE(uint64_t userData, int cqeRes);
+    void SubmitMasterAccept();
+    void SubmitMasterTimerRead();
 
     void NewConnection(int fd);
     void RemoveConnection(const PtrConnection& conn);
@@ -731,7 +596,7 @@ private:
     bool        _releaseOrNot;
 
     Socket           _listenSock;
-    EpollEventLoop   _master;
+    Proactor    _master;
     SlavePool*       _pool;
 
     // 时间轮（仿照原版 TimeWheel）
@@ -1213,9 +1078,9 @@ inline TcpServer::TcpServer(uint16_t port)
     timerfd_settime(_timerFd, 0, &its, nullptr);
 
     // 绑定 Master 的 CQE 处理器
-    // 注册 listen fd 和 timerfd 到 epoll（边缘触发）
-    _master.AddFd(_listenSock.Fd(), [this]() { HandleAccept(); });
-    _master.AddFd(_timerFd, [this]() { HandleTimer(); });
+    _master.SetCQHandler([this](uint64_t userData, int cqeRes) {
+        OnMasterCQE(userData, cqeRes);
+    });
 
     _pool = new SlavePool(4);
 }
@@ -1235,29 +1100,55 @@ inline void TcpServer::SetThreadsCount(int n) {
 
 inline void TcpServer::Start() {
     _pool->Start();
-
     // 在进入 Run() 之前提交初始 accept 和 timerfd read SQE
-    // epoll 模式下 listen fd 和 timerfd 已注册，直接启动即可
-
-    LOG(INFO) << "Master Proactor starting on main thread...";
+    SubmitMasterAccept();
+    SubmitMasterTimerRead();
+    _master.FlushSubmits();  // flush initial accept + timer SQEs
+    LOG(INFO) << "Master Proactor (io_uring) starting on main thread...";
     _master.Start();
 }
 
-// ── accept 处理（epoll 边缘触发，while 循环批量摘连接）────────────────────
+// ── Master CQE 分发 ───────────────────────────────────────────────────────────
 
-inline void TcpServer::HandleAccept() {
-    while (true) {
-        int fd = accept4(_listenSock.Fd(), nullptr, nullptr, SOCK_NONBLOCK);
-        if (fd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            LOG(ERROR) << "Accept error: " << strerror(errno);
-            break;
-        }
-        NewConnection(fd);
+inline void TcpServer::OnMasterCQE(uint64_t userData, int cqeRes) {
+    switch (GetOpType(userData)) {
+    case OpType::ACCEPT: HandleAccept(cqeRes); break;
+    case OpType::TIMER:  HandleTimer(cqeRes);  break;
+    default: break;
     }
 }
 
-// ── 创建连接 ──────────────────────────────────────────────────────────────────
+// ── Master 提交操作 ───────────────────────────────────────────────────────────
+
+inline void TcpServer::SubmitMasterAccept() {
+    _master.SubmitAccept(_listenSock.Fd(), 0);
+}
+
+inline void TcpServer::SubmitMasterTimerRead() {
+    static uint64_t timerBuf = 0;
+    _master.SubmitRead(_timerFd, &timerBuf, sizeof(uint64_t), 0, OpType::TIMER);
+}
+
+// ── accept 处理（io_uring 异步 accept，每次完成后重新提交）───────────────────
+
+inline void TcpServer::HandleAccept(int newFd) {
+    if (newFd < 0) {
+        if (newFd != -EAGAIN && newFd != -EINTR) {
+            LOG(ERROR) << "Accept error: " << strerror(-newFd);
+        }
+        SubmitMasterAccept();
+        return;
+    }
+
+    // 设置非阻塞
+    int flags = fcntl(newFd, F_GETFL, 0);
+    fcntl(newFd, F_SETFL, flags | O_NONBLOCK);
+
+    NewConnection(newFd);
+
+    // Proactor 模式：accept 是一次性的，必须重新提交
+    SubmitMasterAccept();
+}
 
 inline void TcpServer::NewConnection(int fd) {
     uint64_t id = Proactor::NextConnId();
@@ -1310,14 +1201,12 @@ inline void TcpServer::RemoveConnectionInMaster(const PtrConnection& conn) {
                << _connections.size();
 }
 
-// ── 时间轮处理（每秒 tick，epoll 边缘触发自动通知）────────────────────────
+// ── 时间轮处理（每秒 tick）────────────────────────────────────────────────────
 
-inline void TcpServer::HandleTimer() {
-    uint64_t ticks = 0;
-    ssize_t n = read(_timerFd, &ticks, sizeof(ticks));
-    if (n <= 0) return;
+inline void TcpServer::HandleTimer(int times) {
+    if (times <= 0) { SubmitMasterTimerRead(); return; }
 
-    for (uint64_t i = 0; i < ticks; ++i) {
+    for (int i = 0; i < times; ++i) {
         _timerTick = (_timerTick + 1) % TIMER_CAPACITY;
 
         // 1. 释放空闲超时的连接
@@ -1344,7 +1233,11 @@ inline void TcpServer::HandleTimer() {
             }
         }
     }
-    // 注：_master.ProcessTasks() 由 EpollEventLoop::Run() 的 epoll_wait 循环自动调用
+
+    // 处理 Master 的积压任务
+    _master.ProcessTasks();
+
+    SubmitMasterTimerRead();
 }
 
 // ── RunAfter（延迟执行回调）───────────────────────────────────────────────────
